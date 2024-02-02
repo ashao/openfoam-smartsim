@@ -33,6 +33,8 @@ License
 #include "dictionary.H"
 #include "Time.H"
 #include "addToRunTimeSelectionTable.H"
+#include "surfaceFieldValue.H"
+#include "functionObject.H"
 
 // * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
 
@@ -246,6 +248,23 @@ Foam::smartRedisClient::sendGeometricFields
     updateNamingConventionState();
     word dsName = extractName("dataset", namingConventionState_);
     DataSet ds(dsName);
+    sendAllFields<supportedFieldTypes>(ds, fieldNames, patchNames);
+    client().put_dataset(ds);
+}
+
+void
+Foam::smartRedisClient::sendSurfaceFieldValues
+(
+    const functionObject& surfaceFVFunctionObject
+)
+{
+
+    
+    updateNamingConventionState();
+    word dsName = extractName("dataset", namingConventionState_);
+    DataSet ds(dsName);
+
+
     sendAllFields<supportedFieldTypes>(ds, fieldNames, patchNames);
     client().put_dataset(ds);
 }

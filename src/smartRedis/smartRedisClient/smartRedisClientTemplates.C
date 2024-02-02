@@ -53,11 +53,11 @@ void smartRedisClient::packFields
                 size_t(pName == "internal" ? sField.size() : mesh().boundaryMesh()[patch].size()),
                 size_t(pTraits<typename T::value_type>::nComponents)
             };
-            dictionary schemeValues = namingConventionState_;
+            dictionary schemeValues = namingConventionFieldsState_;
             schemeValues.subDict("field").set<string>("name", fName);
             schemeValues.subDict("field").set<string>("patch", pName);
             word fNameDB = extractName("field", schemeValues);
-            const void* data = 
+            const void* data =
                 pName == "internal"
                 ? sField.internalField().cdata()
                 : sField.boundaryField()[patch].cdata();
@@ -103,7 +103,7 @@ void smartRedisClient::getFields
             std::vector<size_t> dims = {
                 patch_size*size_t(pTraits<typename T::value_type>::nComponents)
             };
-            dictionary schemeValues = namingConventionState_;
+            dictionary schemeValues = namingConventionFieldsState_;
             schemeValues.subDict("field").set<string>("name", fName);
             schemeValues.subDict("field").set<string>("patch", pName);
             word fNameDB = extractName("field", schemeValues);

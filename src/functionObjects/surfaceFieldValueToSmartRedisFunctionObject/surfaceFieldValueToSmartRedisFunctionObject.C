@@ -26,11 +26,13 @@ License
 
 \*---------------------------------------------------------------------------*/
 
-#include "fieldsToSmartRedisFunctionObject.H"
+#include "surfaceFieldValueToSmartRedisFunctionObject.H"
 #include "Time.H"
-#include "fvMesh.H"
 #include "addToRunTimeSelectionTable.H"
 #include "smartRedisClient.H"
+#include "surfaceFieldValue.H"
+#include "functionObjectList.H"
+#include "functionObject.H"
 
 // * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
 
@@ -38,50 +40,83 @@ namespace Foam
 {
 namespace functionObjects
 {
-    defineTypeNameAndDebug(fieldsToSmartRedisFunctionObject, 0);
+    defineTypeNameAndDebug(surfaceFieldValueToSmartRedisFunctionObject, 0);
     addToRunTimeSelectionTable
     (
         functionObject,
-        fieldsToSmartRedisFunctionObject,
+        surfaceFieldValueToSmartRedisFunctionObject,
         dictionary
     );
 }
-}
 
+}
 
 // * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
 
-Foam::functionObjects::fieldsToSmartRedisFunctionObject::fieldsToSmartRedisFunctionObject
+Foam::functionObjects::surfaceFieldValueToSmartRedisFunctionObject::surfaceFieldValueToSmartRedisFunctionObject
 (
     const word& name,
     const Time& runTime,
     const dictionary& dict
 )
 :
-    fvMeshFunctionObject(name, runTime, dict),
     smartRedisClient(name, runTime, dict),
-    fields_(dict.lookup("fields")),
-    patches_(dict.lookupOrDefault("patches", wordList{"internal"}))
+    surfaceFVFunctionObjects_(dict.lookup("surfaceFieldValues")),
 {}
 
-bool
-Foam::functionObjects::fieldsToSmartRedisFunctionObject::execute()
+void Foam::functionObjects::surfaceFieldValueToSmartRedisFunctionObject::_checkNames(functionObjectList& fOL)
 {
-    Info<< "Writing fields to SmartRedis database\n" << endl;
-    updateNamingConventionFieldsState();
-    sendGeometricFields(fields_, patches_);
+    forAll(surfaceFVFunctionObjects, i)
+    {
+       if (fOL.findObjectID(i) == -1)
+       {
+        FatalErrorInFunction << "Function Object: " << i
+            << "was not found in the function object list. "
+            << "Make sure it was defined in the controlDict."
+            << nl << exit(FatalError);
+       }
+       // fO->type can be used to query the actual type of the functionObject
+    }
+}
+
+bool
+Foam::functionObjects::surfaceFieldValueToSmartRedisFunctionObject::execute()
+{
+    Info<< "Writing surfaceFieldValues to SmartRedis database\n" << endl;
+
+    functionObjectList fOL
+    (
+        IOobject
+        (
+            "controlDict",
+            runTime_.timeName(),
+            mesh_,
+            IOobject::MUST_READ_IF_MODIFIED,
+            IOobject::NO_WRITE
+        ),
+        dict_
+    );
+
+    _checkNames(fOL);
+    updateNamingConventionState();
+    forAll(surfaceFVFunctionObjects_, i)
+    {
+        autoPtr<surfaceFieldValue> surfaceFVFunctionObject =
+            fOL.findObject(i);
+        sendSurfaceFieldValueFields(surfaceFVFunctionObject);
+    }
     return true;
 }
 
 
 bool
-Foam::functionObjects::fieldsToSmartRedisFunctionObject::write()
+Foam::functionObjects::surfaceFieldValueToSmartRedisFunctionObject::write()
 {
     return true;
 }
 
 bool
-Foam::functionObjects::fieldsToSmartRedisFunctionObject::end()
+Foam::functionObjects::surfaceFieldValueToSmartRedisFunctionObject::end()
 {
     DataSet ds = getMetadata();
     ds.add_meta_string("EndTimeIndex", Foam::name(mesh().time().timeIndex()));
