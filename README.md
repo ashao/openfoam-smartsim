@@ -12,6 +12,9 @@ The sub-module provides examples for coupling OpenFOAM with SmartSim
 
 ## License
 
+
+
+
 The source code license: GPL-3.0-or-later
 
 ## Requirements
