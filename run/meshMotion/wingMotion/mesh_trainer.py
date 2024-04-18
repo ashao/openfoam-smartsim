@@ -45,7 +45,7 @@ def train(num_mpi_ranks):
     torch.set_default_dtype(torch.float64)
     
     # Initialize the model
-    model = MLP(num_layers=10, layer_width=20, input_size=2, output_size=2, activation_fn=torch.nn.Tanh())
+    model = MLP(num_layers=5, layer_width=20, input_size=2, output_size=2, activation_fn=torch.nn.Tanh())
     
     # Make sure all datasets are avaialble in the smartredis database.
     local_time_index = 1
