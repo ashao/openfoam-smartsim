@@ -6,6 +6,7 @@ import numpy as np
 import io
 from sklearn.model_selection import train_test_split
 import torch.optim as optim 
+import time
 
 from sklearn.metrics import mean_squared_error
 class MLP(nn.Module):
@@ -44,7 +45,7 @@ def train(num_mpi_ranks):
     torch.set_default_dtype(torch.float64)
     
     # Initialize the model
-    model = MLP(num_layers=3, layer_width=50, input_size=2, output_size=2, activation_fn=torch.nn.Sigmoid())
+    model = MLP(num_layers=10, layer_width=20, input_size=2, output_size=2, activation_fn=torch.nn.Tanh())
     
     # Make sure all datasets are avaialble in the smartredis database.
     local_time_index = 1
@@ -113,6 +114,7 @@ def train(num_mpi_ranks):
         points_train, points_val, displ_train, displ_val = train_test_split(points, displacements, 
                                                                             test_size=0.2, random_state=42)
     
+        target_rmse = 1e-4
         # PYTORCH Training Loop
         if local_time_index == 1: # provide sufficient epochs in the first time step
             epochs = 10000
@@ -126,6 +128,7 @@ def train(num_mpi_ranks):
         mean_mag_displ = torch.mean(torch.norm(displ_train, dim=1))
         validation_rmse = []
         model.train()
+        start_train_time = time.time()
         for epoch in range(epochs):    
             # Zero the gradients
             optimizer.zero_grad()
@@ -146,8 +149,10 @@ def train(num_mpi_ranks):
                 mse_loss_val = loss_func(displ_pred_val, displ_val)
                 rmse_loss_val = torch.sqrt(mse_loss_val)
                 validation_rmse.append(rmse_loss_val)
+            if rmse_loss_val < target_rmse:
+                break
     
-        print (f"RMSE {validation_rmse[-1]}")
+        print(f"RMSE {validation_rmse[-1]} after {epoch} epochs: {time.time() - start_train_time}s", flush=True)
         # Uncomment to visualize validation RMSE
         # plt.loglog()
         # plt.title("Validation loss RMSE")
