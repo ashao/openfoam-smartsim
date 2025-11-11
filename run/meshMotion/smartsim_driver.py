@@ -11,11 +11,13 @@ from smartsim import Experiment
 platform_config = {
     "local": {
         "launcher": "local",
-        "interface": "lo"
+        "interface": "lo",
+        "run_command": "mpirun"
     },
     "hotlum": {
         "launcher": "slurm",
-        "interface": "bond0"
+        "interface": "bond0",
+        "run_command": "srun"
     }
 }
 
@@ -57,7 +59,7 @@ def main(args):
     openfoam_rs = exp.create_run_settings(
         exe="moveDynamicMesh",
         exe_args="-parallel",
-        run_command="mpirun"
+        run_command=platform_config[args.platform]["run_command"]
     )
     openfoam_rs.set_tasks(num_mpi_ranks)
     openfoam_rs.set_nodes(1)
@@ -75,17 +77,18 @@ def main(args):
 
     training_rs = exp.create_run_settings(
         exe="python",
-        exe_args=f"ml_model_training.py {num_mpi_ranks} {args.radius_power} elastic"
+        exe_args=f"ml_model_training.py {num_mpi_ranks} {args.radius_power} NavierCauchy3d"
     )
     training_rs.set_tasks(1)
     training_rs.set_nodes(1)
+    training_rs.set_cpus_per_task(128)
 
     ml_model_training = exp.create_model(
         name="ml_model_training",
         run_settings=training_rs
     )
     ml_model_training.attach_generator_files(
-        to_copy=["ml_model_training.py", "networks/MLP.py", "networks/elasticPINN.py"]
+        to_copy=["ml_model_training.py", "networks/MLP.py", "networks/PINN.py", "networks/elastic_5nodes_2layer.pth"]
     )
 
     exp.generate(ml_model_training, overwrite=True)

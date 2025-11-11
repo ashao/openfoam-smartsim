@@ -353,25 +353,15 @@ void Foam::displacementSmartSimMotionSolver::solve()
         );
     }
 
-    // Refresh points_MPI_<rank> with current mesh points.
-    // writeMeshPointsToDatabase();  // TODO(TM): can we remove this using points0 displacements?
-
-    bool model_ready = client_.poll_key("model_ready", 1, 100000);
+    bool model_ready = client_.poll_key("displacements_ready", 1, 100000);
     if (! model_ready)
     {
         FatalErrorInFunction
-            << "Displacement model not available in the SmartRedis database."
+            << "Displacements not available in the SmartRedis database."
             << exit(Foam::FatalError);
     }
-    else // Perform forward inference in the database and assign rank-displacements
+    else // Assign rank-displacements
     {
-        // Perform the forward inference in SmartRedis
-        client_.run_model(
-            "model",
-            {rankMeshPointsName_},
-            {rankMeshDisplacementsName_}
-        );
-
         // Allocate the displacements buffer.
         const auto& meshPoints = fvMesh_.points();
         std::vector<double> rankMeshDisplacements(
@@ -411,7 +401,7 @@ void Foam::displacementSmartSimMotionSolver::solve()
         (runTime.timeOutputValue() >= runTime.endTime().value()))
     {
         std::vector<double> end_time_vec {double(runTime.timeIndex())};
-        Info << "Seting end time flag : " << end_time_vec[0] << endl;
+        Info << "Setting end time flag : " << end_time_vec[0] << endl;
         client_.put_tensor(
             "final_iteration",
             end_time_vec.data(),
@@ -426,7 +416,7 @@ void Foam::displacementSmartSimMotionSolver::solve()
     reduce(totalRank, sumOp<label>(), totalRank);
 
     if (Pstream::myProcNo() == 0)
-        client_.delete_tensor("model_ready");
+        client_.delete_tensor("displacements_ready");
 }
 
 // ************************************************************************* //

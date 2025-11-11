@@ -1,23 +1,21 @@
-import argparse
-import torch
 import numpy as np
-import io
+import torch
 import torch.optim as optim
 
 from matplotlib import pyplot as plt
 from smartredis import Client
 
 from MLP import MLP, MLPTrainer
-from elasticPINN import ElasticModel, ElasticTrainer
+import PINN
 
+import argparse
+import io
+from pathlib import Path
 
-def train(args):
-    client = Client()
+point_key = lambda i: f"points_MPI_{i}"
+displacements_key = lambda i: f"displacements_MPI_{i}"
 
-    # Read the solution direction from a database
-    dimension = int(client.get_tensor("solution_dim")[0])
-
-    print (f"Solution dimension = {dimension}.")
+def retrieve_model(args, dimension):
     # Initialize the model
     if args.model_name == "mlp":
         model = MLP(
@@ -27,21 +25,63 @@ def train(args):
             layer_width=10,
             activation_fn=torch.nn.ELU()
         )
-    elif args.model_name == "elastic":
-        model = ElasticModel(
-            layer_size=20,
-            nr_layers=3
+    else:
+        model = PINN.MLP(
+            layer_size=5,
+            nr_layers=2,
         )
 
-    data_ready = client.poll_key("points", 1, 10000)
-    points = client.get_tensor("points")
-    interior_points = np.vstack([client.get_tensor(f"points_MPI_{i}") for i in range(4)])
-    np.random.shuffle(interior_points)
-    X = torch.from_numpy(points).to(torch.float)
-    X_int = torch.from_numpy(interior_points).to(torch.float)
-    # Make sure all datasets are avaialble in the smartredis database.
+    return model
 
-    epochs = 5000
+def retrieve_trainer(args, model, X_int, X, y):
+    # Initalize the trainer from scratch each time
+    if args.model_name == "mlp":
+        trainer = MLPTrainer(model, X, y, radius_power=args.radius_power)
+        return trainer
+    try:
+        eq = getattr(PINN, args.model_name)()
+    except AttributeError:
+        raise ValueError(f"Invalid bulk constraint: {args.model_name}")
+
+    trainer = PINN.PINNTrainer(model, X, y, X_int, eq)
+    return trainer
+
+def retrieve_bulk_points(client, mpi_ranks):
+    bulk_points_by_rank = {r: client.get_tensor(point_key(r)) for r in mpi_ranks}
+    bulk_points = np.vstack(list(bulk_points_by_rank.values()))
+    start = 0
+    indices = {}
+    for r, rank_points in bulk_points_by_rank.items():
+        end = start + rank_points.shape[0]
+        indices[r] = np.arange(start, end)
+        start = end
+
+    return bulk_points, indices
+
+def train(args):
+
+    mpi_ranks = range(args.mpi_ranks)
+    client = Client()
+
+    # Read the solution direction from a database
+
+    # Pause until the OpenFOAM simulation has posted the boundary points
+    points_ready = client.poll_key("points", 1, 10000)
+    if not points_ready:
+        raise Exception("'points' key not found. Simulation may have failed")
+    dimension = int(client.get_tensor("solution_dim")[0])
+    print (f"Solution dimension = {dimension}.", flush=True)
+    model = retrieve_model(args, dimension)
+
+    # Retrieve the boundary and bulk points
+    points = client.get_tensor("points")
+    interior_points, rank_indices = retrieve_bulk_points(client, mpi_ranks)
+
+    # Convert to tensors
+    X = torch.from_numpy(points).to(torch.float)
+    X_bulk = torch.from_numpy(interior_points).to(torch.float)
+
+    epochs = 100
     iteration = 1
     while True:
 
@@ -53,19 +93,16 @@ def train(args):
             raise RuntimeError("Data not found in SmartRedis; aborting training.")
 
         displacements = client.get_tensor("displacements")
+        np.savez(f"data_{iteration:03d}.npz", points, interior_points, displacements)
         client.delete_tensor("data_ready")
         y = torch.from_numpy(displacements).to(torch.float)
 
-        # Initalize the trainer from scratch each time
-        if args.model_name == "mlp":
-            trainer = MLPTrainer(model, X, y, radius_power=args.radius_power)
-        elif args.model_name == "elastic":
-            trainer = ElasticTrainer(model, X_int, X, y)
+        trainer = retrieve_trainer(args, model, X_bulk, X, y)
 
         for epoch in range(epochs):
-            loss, model = trainer.training_step(epoch)
-            if (epoch-1) % 50 == 0:
-                print(loss.item())
+            loss, model_trained = trainer.training_step(epoch)
+            if (epoch-1) % 10 == 0:
+                print(loss.item(), flush=True)
             if trainer.converged():
                 break
 
@@ -76,22 +113,15 @@ def train(args):
             displacements=displacements,
         )
 
-        # Store the model into SmartRedis
-        # Put the model in evaluation mode.
-        model.eval() # TEST
-        model.double()
-        # Prepare a sample input
-        example_forward_input = torch.rand(dimension)
-        # Convert the PyTorch model to TorchScript
-        model_script = torch.jit.trace(model, example_forward_input)
-        # Save the TorchScript model to a buffer
-        model_buffer = io.BytesIO()
-        torch.jit.save(model_script, model_buffer)
-        # Set the model in the SmartRedis database
-        print("Saving model")
-        client.set_model("model", model_buffer.getvalue(), "TORCH", "CPU")
-        client.put_tensor("model_ready", np.array([0]))
-        model.float()
+        # Put the model in evaluation mode and perform the inference for bulk points
+        model_trained.eval()
+        bulk_displacements = model(X_bulk).detach().to("cpu").numpy().astype(np.float64)
+        # Put all the displacements back into the database by rank
+        for r in mpi_ranks:
+            displacements_rank = bulk_displacements[rank_indices[r],...]
+            client.put_tensor(displacements_key(r), displacements_rank)
+
+        client.put_tensor("displacements_ready", np.array([0]))
 
         # Increase CFD+ML iteration
         iteration = iteration + 1
@@ -107,7 +137,6 @@ if __name__ == "__main__":
     parser.add_argument("radius_power", help="power law to weight losses", type=float)
     parser.add_argument("model_name",
                         help="which model to use to calculate interior displacements",
-                        choices=["mlp", "elastic"],
                         type=str
     )
     args = parser.parse_args()

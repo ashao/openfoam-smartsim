@@ -225,3 +225,10 @@ polyMesh/
 # Time step folders
 [0-9][0-9]*
 0/
+
+# meshMotion
+run/meshMotion/*Input
+
+# Build Directories
+src/**/Make
+applications/**/Make
