@@ -2,4 +2,4 @@
 *.stl 
 *.csv
 *.pdf
-ellipsoid3D_MachineLearningMeshMotion/*
+meshMotion_*

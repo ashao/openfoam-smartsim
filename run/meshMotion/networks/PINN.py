@@ -12,6 +12,7 @@ from physicsnemo.sym.domain import Domain
 from physicsnemo.sym.domain.constraint import PointwiseConstraint
 from physicsnemo.sym.key import Key
 from physicsnemo.sym.models.fully_connected import FullyConnectedArch
+from physicsnemo.sym.models.activation import Activation
 
 from abc import ABC, abstractmethod
 
@@ -21,6 +22,20 @@ torch.cuda.nvtx.range_push = lambda *_, **__: None
 torch.cuda.nvtx.range_pop = lambda *_, **__: None
 
 from random import shuffle
+
+
+class MLP:
+   def __init__(self, layer_size=20, nr_layers=3, **kwargs):
+      self.model = FullyConnectedArch(
+         input_keys=[Key("x"), Key("y"), Key("z")],
+         output_keys=[Key("u"), Key("v"), Key("w")],
+         layer_size=10,
+         nr_layers=3,
+         activation_fn=Activation.ELU
+      )
+   def __call__(self, X):
+      return self.model._impl.forward(X)
+
 
 class MeshMotionBulk(ABC, PDE):
 
@@ -46,8 +61,50 @@ class MeshMotionBulk(ABC, PDE):
    def create_interior_condition(self, nodes, bulk_points):
       pass
 
+
+class Laplace3d(MeshMotionBulk):
+   def __init__(self):
+      super().__init__()
+      self._define_equations()
+
+   def name(self):
+      return "Laplace"
+
+   def _define_equations(self):
+      x, y, z = self.x, self.y, self.z
+      u, v, w = self.u, self.v, self.w
+
+      laplace_u = u.diff(x,2) + u.diff(y,2) + u.diff(z,2)
+      laplace_v = v.diff(x,2) + v.diff(y,2) + v.diff(z,2)
+      laplace_w = w.diff(x,2) + w.diff(y,2) + w.diff(z,2)
+
+      self.equations = {
+         "mom_x": laplace_u,
+         "mom_y": laplace_v,
+         "mom_z": laplace_w,
+      }
+
+   def create_interior_condition(self, nodes, bulk_points):
+      # Enforce the Navier-Lame equations in the interior
+      n_bulk_points = bulk_points.shape[0]
+      interior_condition = PointwiseConstraint.from_numpy(
+         nodes=nodes,
+         invar={
+            "x": np.expand_dims(bulk_points[:,0], -1),
+            "y": np.expand_dims(bulk_points[:,1], -1),
+            "z": np.expand_dims(bulk_points[:,2], -1),
+         },
+         outvar={
+            "mom_x": np.zeros((n_bulk_points,1)),
+            "mom_y": np.zeros((n_bulk_points,1)),
+            "mom_z": np.zeros((n_bulk_points,1)),
+         },
+         batch_size=n_bulk_points
+      )
+      return interior_condition
+
 class NavierCauchy3d(MeshMotionBulk):
-   def __init__(self, nu=0.1):
+   def __init__(self, nu=0.025):
       super().__init__()
       self.nu = nu
       self._define_equations(nu)
@@ -92,7 +149,7 @@ class NavierCauchy3d(MeshMotionBulk):
       return interior_condition
 
 
-class StrainMinimization(MeshMotionBulk):
+class StrainRate(MeshMotionBulk):
    def __init__(self):
       super().__init__()
       self._define_equations()
@@ -138,17 +195,47 @@ class StrainMinimization(MeshMotionBulk):
       return interior_condition
 
 
+class StrainRateNoShear(MeshMotionBulk):
+   def __init__(self):
+      super().__init__()
+      self._define_equations()
 
-class MLP:
-   def __init__(self, layer_size=20, nr_layers=3):
-      self.model = FullyConnectedArch(
-          input_keys=[Key("x"), Key("y"), Key("z")],
-          output_keys=[Key("u"), Key("v"), Key("w")],
-          layer_size=20,
-          nr_layers=3
+   def name(self):
+      return "StrainTensor"
+
+   def _define_equations(self):
+      element = lambda u_i, u_j, x_i, x_j: Rational(1,2)*(u_i.diff(x_j) + u_j.diff(x_i))
+      x, y, z = self.x, self.y, self.z
+      u, v, w = self.u, self.v, self.w
+
+      # Off diagonal
+      e_xy = element(u, v, x, y)
+      e_xz = element(u, w, x, z)
+      e_yz = element(v, w, y, z)
+
+      # Euclidean norm of stress tensor (squared)
+      self.equations = {
+         "strain_norm": sym_sqrt(2*(e_xy**2 + e_xz**2 + e_yz**2))
+      }
+
+   def create_interior_condition(self, nodes, bulk_points):
+      # Enforce the Navier-Lame equations in the interior
+      n_bulk_points = bulk_points.shape[0]
+      interior_condition = PointwiseConstraint.from_numpy(
+         nodes=nodes,
+         invar={
+            "x": np.expand_dims(bulk_points[:,0], -1),
+            "y": np.expand_dims(bulk_points[:,1], -1),
+            "z": np.expand_dims(bulk_points[:,2], -1),
+         },
+         outvar={
+            "strain_norm": np.zeros((n_bulk_points,1)),
+         },
+         batch_size=n_bulk_points
       )
-   def __call__(self, X):
-      return self.model._impl.forward(X)
+      return interior_condition
+
+
 
 class PINNTrainer(ABC):
    def __init__(
@@ -222,7 +309,7 @@ class PINNTrainer(ABC):
       self.loss_value = agg_loss
       agg_loss.backward()
       self.optimizer.step()
-      return agg_loss, self.model.model._impl
+      return agg_loss
 
    def converged(self):
       if self.loss_value.item() < self.loss_stop:

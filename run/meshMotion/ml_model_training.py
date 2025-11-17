@@ -15,6 +15,23 @@ from pathlib import Path
 point_key = lambda i: f"points_MPI_{i}"
 displacements_key = lambda i: f"displacements_MPI_{i}"
 
+class PatienceMonitor:
+    def __init__(self, relative_tolerance=0.01, max_patience_steps=10):
+        self.relative_tolerance=relative_tolerance
+        self.max_patience_steps = max_patience_steps
+        self.best_loss = np.inf
+        self.counter = 0
+
+    def step(self, loss):
+        if loss < self.best_loss:
+            self.best_loss = loss
+            self.counter = 0
+        else:
+            self.counter += 1
+
+    def should_stop(self):
+        return self.counter == self.max_patience_steps
+
 def retrieve_model(args, dimension):
     # Initialize the model
     if args.model_name == "mlp":
@@ -27,8 +44,8 @@ def retrieve_model(args, dimension):
         )
     else:
         model = PINN.MLP(
-            layer_size=5,
-            nr_layers=2,
+            layer_size=10,
+            nr_layers=3,
         )
 
     return model
@@ -70,18 +87,23 @@ def train(args):
     if not points_ready:
         raise Exception("'points' key not found. Simulation may have failed")
     dimension = int(client.get_tensor("solution_dim")[0])
-    print (f"Solution dimension = {dimension}.", flush=True)
-    model = retrieve_model(args, dimension)
 
     # Retrieve the boundary and bulk points
     points = client.get_tensor("points")
     interior_points, rank_indices = retrieve_bulk_points(client, mpi_ranks)
 
-    # Convert to tensors
-    X = torch.from_numpy(points).to(torch.float)
-    X_bulk = torch.from_numpy(interior_points).to(torch.float)
+    X_norm = np.max(np.abs(points))
+    X_norm = 1.
+    print(f"Solution dimension = {dimension}.", flush=True)
+    print(f"X_norm = {X_norm}.", flush=True)
 
-    epochs = 100
+    # Convert to tensors
+    X = torch.from_numpy(points/X_norm).to(torch.float)
+    X_bulk = torch.from_numpy(interior_points/X_norm).to(torch.float)
+
+    state_dict = None
+    model = retrieve_model(args, dimension)
+
     iteration = 1
     while True:
 
@@ -95,18 +117,27 @@ def train(args):
         displacements = client.get_tensor("displacements")
         np.savez(f"data_{iteration:03d}.npz", points, interior_points, displacements)
         client.delete_tensor("data_ready")
-        y = torch.from_numpy(displacements).to(torch.float)
+        y = torch.from_numpy(displacements/X_norm).to(torch.float)
 
         trainer = retrieve_trainer(args, model, X_bulk, X, y)
+        patience_monitor = PatienceMonitor()
+        best_loss = np.inf
 
-        for epoch in range(epochs):
-            loss, model_trained = trainer.training_step(epoch)
+        for epoch in range(args.max_epochs):
+            loss = trainer.training_step(epoch)
+            patience_monitor.step(loss)
+            # Display progress
             if (epoch-1) % 10 == 0:
                 print(loss.item(), flush=True)
-            if trainer.converged():
+            # Always store the best model
+            if loss < best_loss:
+                best_loss = loss
+                best_state = model.model.state_dict()
+            # Stop early either because target tolerance reached or patience has run out
+            if trainer.converged() or patience_monitor.should_stop():
                 break
 
-        print(f"MSE {loss.item()}, number of epochs {epoch}", flush=True)
+        print(f"Loss {best_loss}, number of epochs {epoch}", flush=True)
         np.savez(
             f"data_{iteration:02d}.npz",
             points=points,
@@ -114,8 +145,10 @@ def train(args):
         )
 
         # Put the model in evaluation mode and perform the inference for bulk points
-        model_trained.eval()
-        bulk_displacements = model(X_bulk).detach().to("cpu").numpy().astype(np.float64)
+        model.model.eval()
+        model.model.load_state_dict(best_state)
+        bulk_displacements = model(X_bulk).detach().to("cpu").numpy().astype(np.float64)*X_norm
+        model.model.train()
         # Put all the displacements back into the database by rank
         for r in mpi_ranks:
             displacements_rank = bulk_displacements[rank_indices[r],...]
@@ -124,7 +157,7 @@ def train(args):
         client.put_tensor("displacements_ready", np.array([0]))
 
         # Increase CFD+ML iteration
-        iteration = iteration + 1
+        iteration += 1
 
         # Check final iteration index and break
         if client.poll_key("final_iteration", 10, 10):
@@ -134,11 +167,16 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Training script for mesh motion")
     parser.add_argument("mpi_ranks", help="number of mpi ranks", type=int)
-    parser.add_argument("radius_power", help="power law to weight losses", type=float)
     parser.add_argument("model_name",
                         help="which model to use to calculate interior displacements",
                         type=str
     )
+    parser.add_argument(
+        "--max_epochs",
+        help="Maximum number of training epochs per timestep",
+        type=int,
+        default=1000
+        )
     args = parser.parse_args()
 
     train(args)
