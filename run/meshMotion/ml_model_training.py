@@ -10,13 +10,14 @@ import PINN
 
 import argparse
 import io
+import time
 from pathlib import Path
 
 point_key = lambda i: f"points_MPI_{i}"
 displacements_key = lambda i: f"displacements_MPI_{i}"
 
 class PatienceMonitor:
-    def __init__(self, relative_tolerance=0.01, max_patience_steps=10):
+    def __init__(self, relative_tolerance=0.01, max_patience_steps=50):
         self.relative_tolerance=relative_tolerance
         self.max_patience_steps = max_patience_steps
         self.best_loss = np.inf
@@ -50,7 +51,7 @@ def retrieve_model(args, dimension):
 
     return model
 
-def retrieve_trainer(args, model, X_int, X, y):
+def retrieve_trainer(args, model, X_int, X, y, **kwargs):
     # Initalize the trainer from scratch each time
     if args.model_name == "mlp":
         trainer = MLPTrainer(model, X, y, radius_power=args.radius_power)
@@ -60,7 +61,7 @@ def retrieve_trainer(args, model, X_int, X, y):
     except AttributeError:
         raise ValueError(f"Invalid bulk constraint: {args.model_name}")
 
-    trainer = PINN.PINNTrainer(model, X, y, X_int, eq)
+    trainer = PINN.PINNTrainer(model, X, y, X_int, eq, **kwargs)
     return trainer
 
 def retrieve_bulk_points(client, mpi_ranks):
@@ -80,8 +81,6 @@ def train(args):
     mpi_ranks = range(args.mpi_ranks)
     client = Client()
 
-    # Read the solution direction from a database
-
     # Pause until the OpenFOAM simulation has posted the boundary points
     points_ready = client.poll_key("points", 1, 10000)
     if not points_ready:
@@ -98,8 +97,9 @@ def train(args):
     print(f"X_norm = {X_norm}.", flush=True)
 
     # Convert to tensors
-    X = torch.from_numpy(points/X_norm).to(torch.float)
-    X_bulk = torch.from_numpy(interior_points/X_norm).to(torch.float)
+    X = torch.from_numpy(points).to(torch.float)/X_norm
+    X_bulk = torch.from_numpy(interior_points).to(torch.float)/X_norm
+    X_bulk_gpu= torch.from_numpy(interior_points).to(torch.float).to("cuda")/X_norm
 
     state_dict = None
     model = retrieve_model(args, dimension)
@@ -115,13 +115,15 @@ def train(args):
             raise RuntimeError("Data not found in SmartRedis; aborting training.")
 
         displacements = client.get_tensor("displacements")
-        np.savez(f"data_{iteration:03d}.npz", points, interior_points, displacements)
         client.delete_tensor("data_ready")
-        y = torch.from_numpy(displacements/X_norm).to(torch.float)
 
-        trainer = retrieve_trainer(args, model, X_bulk, X, y)
+        y = torch.from_numpy(displacements).to(torch.float)
+
+        trainer = retrieve_trainer(args, model, X_bulk, X, y, n_bulk_samples=5000)
         patience_monitor = PatienceMonitor()
         best_loss = np.inf
+
+        start = time.perf_counter()
 
         for epoch in range(args.max_epochs):
             loss = trainer.training_step(epoch)
@@ -137,17 +139,13 @@ def train(args):
             if trainer.converged() or patience_monitor.should_stop():
                 break
 
-        print(f"Loss {best_loss}, number of epochs {epoch}", flush=True)
-        np.savez(
-            f"data_{iteration:02d}.npz",
-            points=points,
-            displacements=displacements,
-        )
+        train_time = time.perf_counter() - start
+        print(f"Loss {best_loss}, number of epochs {epoch}, time elapsed: {train_time:.3f}s", flush=True)
 
         # Put the model in evaluation mode and perform the inference for bulk points
         model.model.eval()
         model.model.load_state_dict(best_state)
-        bulk_displacements = model(X_bulk).detach().to("cpu").numpy().astype(np.float64)*X_norm
+        bulk_displacements = model(X_bulk_gpu).detach().to("cpu").numpy().astype(np.float64)
         model.model.train()
         # Put all the displacements back into the database by rank
         for r in mpi_ranks:

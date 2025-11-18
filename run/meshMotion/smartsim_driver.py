@@ -22,7 +22,12 @@ platform_config = {
         "launcher": "slurm",
         "interface": "bond0",
         "run_command": "srun"
-    }
+    },
+    "vader": {
+        "launcher": "slurm",
+        "interface": "bond0",
+        "run_command": "srun"
+    },
 }
 
 def main(args):
@@ -143,7 +148,6 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--platform",
-        choices=["local", "hotlum"],
         default="local",
         help="The platform on which this is being run"
     )

@@ -297,7 +297,7 @@ class PINNTrainer(ABC):
 
    def _create_aggregator(self):
       global_optimizer_model = self.domain.create_global_optimizer_model()
-      self.agg = physicsnemo.sym.loss.aggregator.Sum(
+      self.agg = physicsnemo.sym.loss.aggregator.GradNorm(
          global_optimizer_model.parameters(),
          self.domain.get_num_losses()
       )
