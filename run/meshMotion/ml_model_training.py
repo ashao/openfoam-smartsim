@@ -16,8 +16,12 @@ from pathlib import Path
 point_key = lambda i: f"points_MPI_{i}"
 displacements_key = lambda i: f"displacements_MPI_{i}"
 
+default_device = (
+    torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+)
+
 class PatienceMonitor:
-    def __init__(self, relative_tolerance=0.01, max_patience_steps=50):
+    def __init__(self, relative_tolerance=0.01, max_patience_steps=20):
         self.relative_tolerance=relative_tolerance
         self.max_patience_steps = max_patience_steps
         self.best_loss = np.inf
@@ -51,17 +55,14 @@ def retrieve_model(args, dimension):
 
     return model
 
-def retrieve_trainer(args, model, X_int, X, y, **kwargs):
+def retrieve_trainer(args, model, X_boundary, X_bulk, **kwargs):
     # Initalize the trainer from scratch each time
-    if args.model_name == "mlp":
-        trainer = MLPTrainer(model, X, y, radius_power=args.radius_power)
-        return trainer
     try:
         eq = getattr(PINN, args.model_name)()
     except AttributeError:
         raise ValueError(f"Invalid bulk constraint: {args.model_name}")
 
-    trainer = PINN.PINNTrainer(model, X, y, X_int, eq, **kwargs)
+    trainer = PINN.PINNTrainer(model, X_boundary, X_bulk, eq, **kwargs)
     return trainer
 
 def retrieve_bulk_points(client, mpi_ranks):
@@ -76,6 +77,7 @@ def retrieve_bulk_points(client, mpi_ranks):
 
     return bulk_points, indices
 
+
 def train(args):
 
     mpi_ranks = range(args.mpi_ranks)
@@ -89,20 +91,29 @@ def train(args):
 
     # Retrieve the boundary and bulk points
     points = client.get_tensor("points")
-    interior_points, rank_indices = retrieve_bulk_points(client, mpi_ranks)
+    bulk_points, rank_indices = retrieve_bulk_points(client, mpi_ranks)
 
     X_norm = np.max(np.abs(points))
     X_norm = 1.
-    print(f"Solution dimension = {dimension}.", flush=True)
-    print(f"X_norm = {X_norm}.", flush=True)
+    print(f"Solution dimension = {dimension}", flush=True)
+    print(f"X_norm = {X_norm}", flush=True)
 
-    # Convert to tensors
-    X = torch.from_numpy(points).to(torch.float)/X_norm
-    X_bulk = torch.from_numpy(interior_points).to(torch.float)/X_norm
-    X_bulk_gpu= torch.from_numpy(interior_points).to(torch.float).to("cuda")/X_norm
+    # Scale all the inputs (if needed)
+    boundary_points_scaled = points/X_norm
+    bulk_points_scaled = bulk_points/X_norm
 
-    state_dict = None
+    # Convert all the interior points to a tensor for final inference
+    bulk_points_for_inference = torch.from_numpy(bulk_points_scaled).float().to(args.device)
+
     model = retrieve_model(args, dimension)
+    trainer = retrieve_trainer(
+        args,
+        model,
+        boundary_points_scaled,
+        bulk_points_scaled,
+        n_bulk_samples=1000,
+        loss_stop=1e-2,
+    )
 
     iteration = 1
     while True:
@@ -117,36 +128,58 @@ def train(args):
         displacements = client.get_tensor("displacements")
         client.delete_tensor("data_ready")
 
-        y = torch.from_numpy(displacements).to(torch.float)
-
-        trainer = retrieve_trainer(args, model, X_bulk, X, y, n_bulk_samples=5000)
-        patience_monitor = PatienceMonitor()
-        best_loss = np.inf
-
+        trainer.set_boundary_displacements(displacements)
         start = time.perf_counter()
 
-        for epoch in range(args.max_epochs):
-            loss = trainer.training_step(epoch)
+        # Begin curriculum training
+        # Curriculum 1: Just boundary conditions
+        best_loss = np.inf
+        patience_monitor = PatienceMonitor()
+        for epoch1 in range(args.max_epochs):
+            loss = trainer.step_bc_only()
             patience_monitor.step(loss)
-            # Display progress
-            if (epoch-1) % 10 == 0:
-                print(loss.item(), flush=True)
-            # Always store the best model
             if loss < best_loss:
+                best_state = model.state_dict()
                 best_loss = loss
-                best_state = model.model.state_dict()
+            if patience_monitor.should_stop():
+                break
+        model.load_state_dict(best_state)
+        train_time = time.perf_counter() - start
+        print(f"Curriculum 1: Loss {best_loss}, number of epochs {epoch1}, time elapsed: {train_time:.3f}s", flush=True)
+
+        # Curriculum 2: PDE bulk conditions and boundary conditions
+        best_loss = np.inf
+        patience_monitor = PatienceMonitor()
+        start = time.perf_counter()
+        for epoch2 in range(args.max_epochs):
+            agg_loss, losses = trainer.step(epoch2)
+            patience_monitor.step(agg_loss)
+            # Display progress
+            if (epoch2-1) % 10 == 0:
+                print(f"Epoch {epoch2-1} Aggregated Loss: {agg_loss.item():.3e}")
+                for k,v in losses.items():
+                    print(f"\t{k}: {v.item():.3e}")
+            # Always store the best model
+            if agg_loss < best_loss:
+                best_loss = agg_loss
+                best_state = model.state_dict()
             # Stop early either because target tolerance reached or patience has run out
             if trainer.converged() or patience_monitor.should_stop():
                 break
-
         train_time = time.perf_counter() - start
-        print(f"Loss {best_loss}, number of epochs {epoch}, time elapsed: {train_time:.3f}s", flush=True)
+        print(f"Curriculum 2: Loss {best_loss}, number of epochs {epoch2}, time elapsed: {train_time:.3f}s", flush=True)
 
         # Put the model in evaluation mode and perform the inference for bulk points
-        model.model.eval()
-        model.model.load_state_dict(best_state)
-        bulk_displacements = model(X_bulk_gpu).detach().to("cpu").numpy().astype(np.float64)
-        model.model.train()
+        model.eval()
+        model.load_state_dict(best_state)
+        bulk_displacements = (
+            model._impl.forward(bulk_points_for_inference)
+            .detach()
+            .to("cpu")
+            .numpy()
+            .astype(np.float64)
+        )
+        model.train()
         # Put all the displacements back into the database by rank
         for r in mpi_ranks:
             displacements_rank = bulk_displacements[rank_indices[r],...]
@@ -159,8 +192,8 @@ def train(args):
 
         # Check final iteration index and break
         if client.poll_key("final_iteration", 10, 10):
-           print ("final iteration reached.")
-           break
+            print ("final iteration reached.")
+            break
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Training script for mesh motion")
@@ -175,6 +208,11 @@ if __name__ == "__main__":
         type=int,
         default=1000
         )
+    parser.add_argument(
+        "--device",
+        help="The device to deploy the ML tasks on",
+        default=default_device
+    )
     args = parser.parse_args()
 
     train(args)
