@@ -20,22 +20,93 @@ default_device = (
     torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 )
 
+
+class MultiCriteriaEarlyStopping:
+    def __init__(self, patience=40, relative_tolerance=0.01):
+        """
+        Tracks multiple criteria for early stopping based on relative improvement.
+
+        Args:
+            patience (int): Number of steps to wait without improvement before stopping per criterion.
+            relative_tolerance (float): Minimum relative improvement required (e.g., 0.01 for 1%).
+        """
+        self.patience = patience
+        self.relative_tolerance = relative_tolerance
+        self.best_losses = {}      # Track best loss per component
+        self.counters = {}         # Track patience counter per component
+
+    def step(self, loss_dict):
+        """
+        Update early stopping state based on multiple validation losses.
+
+        All losses are evaluated based on relative improvement:
+        relative_improvement = (best_loss - current_loss) / best_loss
+
+        Args:
+            loss_dict (dict): e.g., {'boundary': 0.2, 'bulk': 0.5, 'pde': 1e-4}
+
+        Returns:
+            bool: True if ALL criteria have stagnated and exceeded patience threshold.
+        """
+        all_stagnant = True
+
+        for key, loss in loss_dict.items():
+            # Convert tensor to float if needed
+            if hasattr(loss, "item"):
+                loss = loss.item()
+
+            # Initialize tracking for this component
+            if key not in self.best_losses:
+                self.best_losses[key] = loss
+                self.counters[key] = 0
+                all_stagnant = False
+                continue
+
+            # Compute relative improvement
+            relative_improvement = (self.best_losses[key] - loss) / self.best_losses[key]
+
+            # Check if improvement meets tolerance
+            if relative_improvement >= self.relative_tolerance:
+                # Improvement found, update best loss and reset counter
+                self.best_losses[key] = loss
+                self.counters[key] = 0
+                all_stagnant = False
+            else:
+                # No improvement, increment patience counter
+                self.counters[key] += 1
+                if self.counters[key] < self.patience:
+                    all_stagnant = False
+
+        self.all_stagnant = all_stagnant
+
+    def reset(self):
+        """Reset the early stopping state."""
+        self.best_losses.clear()
+        self.counters.clear()
+
+    def should_stop(self):
+        """Check if all criteria have stagnated and exceeded patience."""
+        return self.all_stagnant
+
+
 class PatienceMonitor:
     def __init__(self, relative_tolerance=0.01, max_patience_steps=20):
-        self.relative_tolerance=relative_tolerance
+        self.relative_tolerance = relative_tolerance
         self.max_patience_steps = max_patience_steps
         self.best_loss = np.inf
         self.counter = 0
 
     def step(self, loss):
-        if loss < self.best_loss:
-            self.best_loss = loss
+        improvement = (self.best_loss - loss) / self.best_loss
+        if improvement > self.relative_tolerance:
             self.counter = 0
         else:
             self.counter += 1
+        if loss < self.best_loss:
+            self.best_loss = loss
 
     def should_stop(self):
-        return self.counter == self.max_patience_steps
+        return self.counter >= self.max_patience_steps
 
 def retrieve_model(args, dimension):
     # Initialize the model
@@ -49,20 +120,22 @@ def retrieve_model(args, dimension):
         )
     else:
         model = PINN.MLP(
-            layer_size=10,
-            nr_layers=3,
+            layer_size=20,
+            nr_layers=2,
         )
 
     return model
 
-def retrieve_trainer(args, model, X_boundary, X_bulk, **kwargs):
+def retrieve_trainer(args, model, X_boundary, X_bulk, n_bulk_samples, **kwargs):
     # Initalize the trainer from scratch each time
     try:
         eq = getattr(PINN, args.model_name)()
     except AttributeError:
         raise ValueError(f"Invalid bulk constraint: {args.model_name}")
 
-    trainer = PINN.PINNTrainer(model, X_boundary, X_bulk, eq, **kwargs)
+    trainer = PINN.PINNTrainer(
+        model, X_boundary, X_bulk, eq, n_bulk_samples=n_bulk_samples, **kwargs
+    )
     return trainer
 
 def retrieve_bulk_points(client, mpi_ranks):
@@ -77,6 +150,57 @@ def retrieve_bulk_points(client, mpi_ranks):
 
     return bulk_points, indices
 
+def bc_stage(model, trainer, n_epochs):
+    start = time.perf_counter()
+    best_loss = np.inf
+    patience_monitor = PatienceMonitor(relative_tolerance=0.01)
+    for epoch in range(n_epochs):
+        loss = trainer.step_bc_only()
+        patience_monitor.step(loss)
+        if loss < best_loss:
+            best_state = model.state_dict()
+            best_loss = loss
+        if patience_monitor.should_stop():
+            break
+    train_time = time.perf_counter() - start
+    print(
+        f"Boundary Conditions: Loss {best_loss:.3e}, number of epochs {epoch}, time elapsed: {train_time:.3f}s",
+        flush=True,
+    )
+    return best_state, epoch
+
+def bulk_and_bc_stage(model, trainer, n_epochs):
+    best_loss = np.inf
+    patience_monitor = MultiCriteriaEarlyStopping(relative_tolerance=0.01)
+    start = time.perf_counter()
+    for epoch in range(n_epochs):
+        _, _, validation_losses = trainer.step(epoch)
+        sum_validation_losses = sum(validation_losses.values())
+        patience_monitor.step(validation_losses)
+        # Display progress
+        if (epoch-1) % 10 == 0:
+            print(
+                f"\tEpoch {epoch-1} Aggregated Loss: {sum_validation_losses:.3e}",
+                flush=True,
+            )
+            for k,v in validation_losses.items():
+                print(f"\t\t{k}: {v:.3e}", flush=True)
+        # Always store the best model
+        if sum_validation_losses < best_loss:
+            best_loss = sum_validation_losses
+            best_state = model.state_dict()
+        # Stop early either because target tolerance reached or patience has run out
+        if patience_monitor.should_stop():
+            break
+    train_time = time.perf_counter() - start
+    print(f"\tEpoch {epoch-1} Aggregated Loss: {best_loss:.3e}", flush=True)
+    for k,v in validation_losses.items():
+        print(f"\t\t{k}: {v:.3e}", flush=True)
+    print(
+        f"BC and Bulk: Loss {best_loss:.3e}, number of epochs {epoch}, time elapsed: {train_time:.3f}s",
+        flush=True,
+    )
+    return best_state, epoch
 
 def train(args):
 
@@ -93,14 +217,11 @@ def train(args):
     points = client.get_tensor("points")
     bulk_points, rank_indices = retrieve_bulk_points(client, mpi_ranks)
 
-    X_norm = np.max(np.abs(points))
-    X_norm = 1.
-    print(f"Solution dimension = {dimension}", flush=True)
-    print(f"X_norm = {X_norm}", flush=True)
+    print(f"Solution dimension = {dimension} Number of Points={len(points)}", flush=True)
 
     # Scale all the inputs (if needed)
-    boundary_points_scaled = points/X_norm
-    bulk_points_scaled = bulk_points/X_norm
+    boundary_points_scaled = points
+    bulk_points_scaled = bulk_points
 
     # Convert all the interior points to a tensor for final inference
     bulk_points_for_inference = torch.from_numpy(bulk_points_scaled).float().to(args.device)
@@ -111,14 +232,14 @@ def train(args):
         model,
         boundary_points_scaled,
         bulk_points_scaled,
-        n_bulk_samples=1000,
+        n_bulk_samples=2000,
         loss_stop=1e-2,
     )
 
-    iteration = 1
+    timestep = 1
     while True:
-
-        print (f"Iteration {iteration}")
+        print("\n"+"-"*10)
+        print(f"TIMESTEP {timestep}")
 
         # Block until the data is ready
         data_ready = client.poll_key("data_ready", 1, 10000)
@@ -129,46 +250,21 @@ def train(args):
         client.delete_tensor("data_ready")
 
         trainer.set_boundary_displacements(displacements)
-        start = time.perf_counter()
+        mag = np.sum(displacements**2, axis=1)
+        mag_avg = np.mean(mag[mag>0])
+        print(f"Average magnitude of displacements: {mag_avg}")
 
         # Begin curriculum training
-        # Curriculum 1: Just boundary conditions
-        best_loss = np.inf
-        patience_monitor = PatienceMonitor()
-        for epoch1 in range(args.max_epochs):
-            loss = trainer.step_bc_only()
-            patience_monitor.step(loss)
-            if loss < best_loss:
-                best_state = model.state_dict()
-                best_loss = loss
-            if patience_monitor.should_stop():
-                break
+        # Stage: Boundary conditions only
+        best_state, boundary_epochs = bc_stage(model, trainer, args.max_epochs)
         model.load_state_dict(best_state)
-        train_time = time.perf_counter() - start
-        print(f"Curriculum 1: Loss {best_loss}, number of epochs {epoch1}, time elapsed: {train_time:.3f}s", flush=True)
+        # Stage: PDE bulk conditions and boundary conditions
+        best_state, bc_bulk_epochs = bulk_and_bc_stage(model, trainer, args.max_epochs)
+        model.load_state_dict(best_state)
 
-        # Curriculum 2: PDE bulk conditions and boundary conditions
-        best_loss = np.inf
-        patience_monitor = PatienceMonitor()
+        print(f"Training completed in {bc_bulk_epochs+boundary_epochs} epochs")
+
         start = time.perf_counter()
-        for epoch2 in range(args.max_epochs):
-            agg_loss, losses = trainer.step(epoch2)
-            patience_monitor.step(agg_loss)
-            # Display progress
-            if (epoch2-1) % 10 == 0:
-                print(f"Epoch {epoch2-1} Aggregated Loss: {agg_loss.item():.3e}")
-                for k,v in losses.items():
-                    print(f"\t{k}: {v.item():.3e}")
-            # Always store the best model
-            if agg_loss < best_loss:
-                best_loss = agg_loss
-                best_state = model.state_dict()
-            # Stop early either because target tolerance reached or patience has run out
-            if trainer.converged() or patience_monitor.should_stop():
-                break
-        train_time = time.perf_counter() - start
-        print(f"Curriculum 2: Loss {best_loss}, number of epochs {epoch2}, time elapsed: {train_time:.3f}s", flush=True)
-
         # Put the model in evaluation mode and perform the inference for bulk points
         model.eval()
         model.load_state_dict(best_state)
@@ -186,14 +282,10 @@ def train(args):
             client.put_tensor(displacements_key(r), displacements_rank)
 
         client.put_tensor("displacements_ready", np.array([0]))
-
+        send_time = time.perf_counter() - start
+        print(f"Sent displacements in {send_time}")
         # Increase CFD+ML iteration
-        iteration += 1
-
-        # Check final iteration index and break
-        if client.poll_key("final_iteration", 10, 10):
-            print ("final iteration reached.")
-            break
+        timestep += 1
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Training script for mesh motion")

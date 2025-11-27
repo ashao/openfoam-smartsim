@@ -353,8 +353,8 @@ void Foam::displacementSmartSimMotionSolver::solve()
         );
     }
 
-    bool model_ready = client_.poll_key("displacements_ready", 1, 100000);
-    if (! model_ready)
+    bool displacements_ready = client_.poll_key("displacements_ready", 1, 100000);
+    if (! displacements_ready)
     {
         FatalErrorInFunction
             << "Displacements not available in the SmartRedis database."
@@ -391,23 +391,6 @@ void Foam::displacementSmartSimMotionSolver::solve()
         //newDisplacement.boundaryFieldRef().evaluate();
         pointDisplacement_.internalFieldRef() = newDisplacement.internalField();
         pointDisplacement_.boundaryFieldRef().evaluate();
-    }
-
-    // At the end of the simulation, have MPI rank 0 notify the python
-    // client via SmartRedis that the simulation has completed by writing
-    // an end_time_index tensor to SmartRedis.
-    const auto& runTime = fvMesh_.time();
-    if ((Pstream::myProcNo() == 0) &&
-        (runTime.timeOutputValue() >= runTime.endTime().value()))
-    {
-        std::vector<double> end_time_vec {double(runTime.timeIndex())};
-        Info << "Setting end time flag : " << end_time_vec[0] << endl;
-        client_.put_tensor(
-            "final_iteration",
-            end_time_vec.data(),
-            {1},
-            SRTensorTypeDouble, SRMemLayoutContiguous
-        );
     }
 
     // Emulate MPI_Barrier() - wait for all MPI ranks to perform forward

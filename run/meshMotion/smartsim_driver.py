@@ -9,7 +9,7 @@ from pathlib import Path
 from PyFoam.RunDictionary.ParsedParameterFile import ParsedParameterFile
 
 from smartsim import Experiment
-
+from smartsim.status import TERMINAL_STATUSES
 
 
 platform_config = {
@@ -115,10 +115,13 @@ def main(args):
         print(f"Database started at: {db.get_address()}")
         print("Running the OpenFOAM case")
         exp.generate(openfoam_model, overwrite=True)
-        exp.start(openfoam_model, block=False)
+        exp.start(openfoam_model, ml_model_training, block=False)
 
-        # print("Starting the ML model training script")
-        exp.start(ml_model_training, block=True)
+        while True:
+            time.sleep(1)
+            if exp.get_status(openfoam_model)[0] in TERMINAL_STATUSES:
+                exp.stop(ml_model_training)
+                break
 
     except Exception as e:
         print("Caught an exception:", e)

@@ -33,7 +33,7 @@ def MLP(layer_size=20, nr_layers=3, **kwargs):
         output_keys=[Key("u"), Key("v"), Key("w")],
         layer_size=layer_size,
         nr_layers=nr_layers,
-        activation_fn=Activation.SIN,
+        activation_fn=Activation.TANH,
     )
 
 
@@ -182,15 +182,13 @@ class PINNTrainer(ABC):
 
         # Randomly sample bulk
         self.n_bulk_samples = n_bulk_samples
-        self._set_bulk_indices(n_bulk_samples)
-        self.bulk_points = torch.from_numpy(bulk_points[self.bulk_indices]).float().to(device)
+        self._sample_bulk(n_bulk_samples, bulk_points)
 
         # Batch the boundary and bulk points together
         self._batch_boundary_and_interior()
 
         self.optimizer = optim.Adam(model.parameters(), lr=lr)
         self.loss_stop = loss_stop
-        self.loss_value = None
         self._create_aggregator()
 
     def set_boundary_displacements(self, displacements):
@@ -198,21 +196,42 @@ class PINNTrainer(ABC):
             torch.from_numpy(displacements).float().to(self.device)
         )
 
-    def _set_bulk_indices(self, n_bulk_samples):
-        indices = list(range(n_bulk_samples))
+    def _sample_bulk(self, n_bulk_samples, bulk_points):
+        indices = list(range(len(bulk_points)))
         shuffle(indices)
-        self.bulk_indices = indices[:n_bulk_samples]
+        train_indices = indices[:n_bulk_samples]
+        self.bulk_points = (
+            torch.from_numpy(bulk_points[train_indices]).float().to(self.device)
+        )
+
+        validation_indices = indices[n_bulk_samples:2*n_bulk_samples]
+        self.bulk_validation_points = (
+            torch.from_numpy(bulk_points[validation_indices])
+            .float()
+            .to(self.device)
+        )
 
     def _batch_boundary_and_interior(self):
-        self.X = torch.vstack([self.boundary_points, self.bulk_points])
+        self.X = torch.vstack([self.boundary_points, self.bulk_points, self.bulk_validation_points])
         self.X.requires_grad_(True)
-        self.boundary_indices = slice(0, self.n_boundary_points)
-        self.bulk_indices = slice(self.n_boundary_points, None)
+
+        offsets = [
+            self.n_boundary_points,
+            self.n_boundary_points + self.n_bulk_samples
+        ]
+
+        self.boundary_indices = slice(0, offsets[0])
+        self.bulk_train_indices = slice(offsets[0], offsets[1])
+        self.bulk_validation_indices = slice(offsets[1], None)
 
     def _create_aggregator(self):
         nlosses = len(self.eq.equations) + 1
-        self.agg = physicsnemo.sym.loss.aggregator.GradNorm(
-            self.model.parameters(), nlosses
+        weights = {
+            k: torch.tensor(1.0) for k in self.eq.equations.keys()
+        }
+        weights["boundary"] = torch.tensor(10.0)
+        self.agg_training = physicsnemo.sym.loss.aggregator.ResNorm(
+            self.model.parameters(), nlosses, weights=weights
         )
 
     def _calc_residuals(self, y_pred):
@@ -236,23 +255,32 @@ class PINNTrainer(ABC):
     def _model_forward(self, X):
         return self.model._impl.forward(X)
 
-    def _calc_aggregate_losses(self):
+    def _calc_all_losses(self):
         y_pred = self._model_forward(self.X)
         residuals = self._calc_residuals(y_pred)
-        losses = {
-            k: self._residual_to_loss(v[self.bulk_indices]) for k, v in residuals.items()
+        train_losses = {
+            k: self._residual_to_loss(v[self.bulk_train_indices]) for k, v in residuals.items()
         }
-        losses["boundary"] = self._boundary_loss(y_pred[self.boundary_indices, :])
-        return losses
+        train_losses["boundary"] = self._boundary_loss(y_pred[self.boundary_indices, :])
+        validation_losses = {
+            k: self._residual_to_loss(v[self.bulk_validation_indices]) for k, v in residuals.items()
+        }
+
+        return train_losses, validation_losses
 
     def step(self, iteration):
         self.optimizer.zero_grad()
-        losses = self._calc_aggregate_losses()
-        agg_loss = self.agg.forward(losses, iteration)
-        self.loss_value = agg_loss
-        agg_loss.backward()
+        train_losses, validation_losses = self._calc_all_losses()
+        agg_training_loss = self.agg_training.forward(train_losses, iteration)
+        agg_training_loss.backward()
         self.optimizer.step()
-        return agg_loss, losses
+
+        validation_losses ={
+            "pde": np.mean([v.item() for k, v in validation_losses.items() if k != "boundary"]),
+            "boundary": train_losses["boundary"].item()
+        }
+
+        return agg_training_loss, train_losses, validation_losses
 
     def step_bc_only(self):
         self.optimizer.zero_grad()
@@ -260,13 +288,7 @@ class PINNTrainer(ABC):
         loss = self._boundary_loss(y_pred)
         loss.backward()
         self.optimizer.step()
-        self.loss = loss
         return loss
-
-    def converged(self):
-        if self.loss_value.item() < self.loss_stop:
-            return True
-        return False
 
     def reset(self):
         self.optimizer.state.clear()
