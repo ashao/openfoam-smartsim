@@ -85,6 +85,7 @@ class displacementSmartSimMotionSolver
         // - SmartRedis tensor names for ML inference for each MPI rank.
         const word rankMeshPointsName_;
         const word rankMeshDisplacementsName_;
+        const word rankMeshDistancesName_;
 
         // - Flattened boundary points sent to SmartRedis for ML
         std::vector<double> boundaryPoints_;
@@ -106,6 +107,7 @@ class displacementSmartSimMotionSolver
         void writeSolutionDimToDatabase();
         void writeMeshPointsToDatabase();
         void writeBoundaryPointsToDatabase();
+        void writeDistanceToBoundary();
 
 public:
 

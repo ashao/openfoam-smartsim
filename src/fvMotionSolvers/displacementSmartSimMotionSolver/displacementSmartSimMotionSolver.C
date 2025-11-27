@@ -78,6 +78,44 @@ void Foam::displacementSmartSimMotionSolver::writeSolutionDimToDatabase()
                         SRMemLayoutContiguous);
 }
 
+
+void Foam::displacementSmartSimMotionSolver::writeDistanceToBoundary()
+{
+    const auto& meshBoundary = motionSolver::mesh().boundaryMesh();
+    const auto& meshPoints = this->points0();
+    scalarField DistanceToBoundary(meshPoints.size(), GREAT);
+
+    // Loop over all patches on the boundary
+    forAll(meshBoundary, patchI)
+    {
+        if (meshBoundary[patchI].type() == "empty"
+           || meshBoundary[patchI].type() == "processor")
+        {
+           continue;
+        }
+
+        const polyPatch& patch   = meshBoundary[patchI];
+        const labelList& patchPointIds = patch.meshPoints();
+
+        // Loop over all points in the bulk
+        forAll(meshPoints, pointI)
+        {
+            // Loop over all points on the boundary
+            forAll(patchPointIds, id)
+            {
+                scalar dist = mag(meshPoints[pointI] - meshPoints[patchPointIds[id]]);
+                DistanceToBoundary[pointI] = min(DistanceToBoundary[pointI], dist);
+            }
+        }
+    }
+    client_.put_tensor(rankMeshDistancesName_,
+                       DistanceToBoundary.cdata(),
+                       {size_t(meshPoints.size()), 1},
+                       SRTensorTypeDouble,
+                       SRMemLayoutContiguous);
+
+}
+
 void Foam::displacementSmartSimMotionSolver::writeMeshPointsToDatabase()
 {
     const auto& meshPoints = points0(); //fvMesh_.points();
@@ -207,11 +245,13 @@ Foam::displacementSmartSimMotionSolver::displacementSmartSimMotionSolver
     validCmpts_(filterValidCmpts(fvMesh_.solutionD())),
     rankMeshPointsName_("points_MPI_" + std::to_string(Pstream::myProcNo())),
     rankMeshDisplacementsName_("displacements_MPI_" + std::to_string(Pstream::myProcNo())),
+    rankMeshDistancesName_("distances_MPI_" + std::to_string(Pstream::myProcNo())),
     boundaryPoints_(),
     boundaryDisplacements_()
 {
     writeSolutionDimToDatabase();
     writeMeshPointsToDatabase();
+    writeDistanceToBoundary();
     writeBoundaryPointsToDatabase();
 }
 
@@ -243,6 +283,7 @@ displacementSmartSimMotionSolver
 {
     writeSolutionDimToDatabase();
     writeMeshPointsToDatabase();
+    writeDistanceToBoundary();
     writeBoundaryPointsToDatabase();
 }
 
@@ -388,6 +429,7 @@ void Foam::displacementSmartSimMotionSolver::solve()
                 ++globalId;
             }
         }
+
         //newDisplacement.boundaryFieldRef().evaluate();
         pointDisplacement_.internalFieldRef() = newDisplacement.internalField();
         pointDisplacement_.boundaryFieldRef().evaluate();

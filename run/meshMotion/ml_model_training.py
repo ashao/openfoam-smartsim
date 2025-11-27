@@ -3,6 +3,7 @@ import torch
 import torch.optim as optim
 
 from matplotlib import pyplot as plt
+from scipy.interpolate import griddata
 from smartredis import Client
 
 from MLP import MLP, MLPTrainer
@@ -13,7 +14,8 @@ import io
 import time
 from pathlib import Path
 
-point_key = lambda i: f"points_MPI_{i}"
+bulk_points_key = lambda i: f"points_MPI_{i}"
+distances_key = lambda i: f"distances_MPI_{i}"
 displacements_key = lambda i: f"displacements_MPI_{i}"
 
 default_device = (
@@ -138,17 +140,17 @@ def retrieve_trainer(args, model, X_boundary, X_bulk, n_bulk_samples, **kwargs):
     )
     return trainer
 
-def retrieve_bulk_points(client, mpi_ranks):
-    bulk_points_by_rank = {r: client.get_tensor(point_key(r)) for r in mpi_ranks}
-    bulk_points = np.vstack(list(bulk_points_by_rank.values()))
+def retrieve_point_fields(client, mpi_ranks, key_constructor):
+    point_field_by_rank = {r: client.get_tensor(key_constructor(r)) for r in mpi_ranks}
+    point_field = np.vstack(list(point_field_by_rank.values()))
     start = 0
     indices = {}
-    for r, rank_points in bulk_points_by_rank.items():
+    for r, rank_points in point_field_by_rank.items():
         end = start + rank_points.shape[0]
         indices[r] = np.arange(start, end)
         start = end
 
-    return bulk_points, indices
+    return point_field, indices
 
 def bc_stage(model, trainer, n_epochs):
     start = time.perf_counter()
@@ -215,7 +217,8 @@ def train(args):
 
     # Retrieve the boundary and bulk points
     points = client.get_tensor("points")
-    bulk_points, rank_indices = retrieve_bulk_points(client, mpi_ranks)
+    bulk_points, rank_indices = retrieve_point_fields(client, mpi_ranks, bulk_points_key)
+    distance_to_boundary, _ = retrieve_point_fields(client, mpi_ranks, distances_key)
 
     print(f"Solution dimension = {dimension} Number of Points={len(points)}", flush=True)
 
@@ -276,6 +279,7 @@ def train(args):
             .astype(np.float64)
         )
         model.train()
+
         # Put all the displacements back into the database by rank
         for r in mpi_ranks:
             displacements_rank = bulk_displacements[rank_indices[r],...]
@@ -283,7 +287,7 @@ def train(args):
 
         client.put_tensor("displacements_ready", np.array([0]))
         send_time = time.perf_counter() - start
-        print(f"Sent displacements in {send_time}")
+        print(f"Solution sent in {send_time}s")
         # Increase CFD+ML iteration
         timestep += 1
 
