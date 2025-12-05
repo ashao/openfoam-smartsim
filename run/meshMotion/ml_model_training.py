@@ -280,7 +280,6 @@ def train(args):
         )
         model.train()
 
-        # Put all the displacements back into the database by rank
         for r in mpi_ranks:
             displacements_rank = bulk_displacements[rank_indices[r],...]
             client.put_tensor(displacements_key(r), displacements_rank)

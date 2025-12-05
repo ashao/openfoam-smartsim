@@ -3,14 +3,21 @@ cd "${0%/*}" || exit                                # Run from this directory
 . ${WM_PROJECT_DIR:?}/bin/tools/RunFunctions        # Tutorial run functions
 #------------------------------------------------------------------------------
 
+if [ $# -eq 0 ]
+then
+    pinn_type="NavierCauchy3d"
+else
+    pinn_type="$1"
+fi
+
 rm -rf ellipsoid3D_MachineLearningMeshMotionInput
 rm -rf ellipsoid3D_MachineLearningMeshMotion
 
 echo Create the machine learning mesh motion case
 (
-    cp -r ellipsoid3D ellipsoid3D_MachineLearningMeshMotionInput
+    cp -r ellipsoid3D ellipsoid3D_input
 
-    cd ellipsoid3D_MachineLearningMeshMotionInput
+    cd ellipsoid3D_input
 
     echo Create .foam file for visualization in ParaView 
     touch ellipsoid3D_MachineLearningMeshMotion.foam
@@ -24,17 +31,18 @@ echo Create the machine learning mesh motion case
     cd ..
 
     echo Run the smartsim_driver that coordinates Machine Learning and CFD 
-    python smartsim_driver.py --experiment ellipsoid3D_MachineLearningMeshMotion \
-        --case ellipsoid3D_MachineLearningMeshMotionInput
+    python smartsim_driver.py --case ellipsoid3D_input \
+        --pinn-type "${pinn_type}"
 
-    cd ellipsoid3D_MachineLearningMeshMotion/ellipsoid3D_MachineLearningMeshMotionInput
+    cd meshMotion_ellipsoid3D_input_PINN_"${pinn_type}"/ellipsoid3D_input
 
     # Compute the mesh quality fields 
-    runParallel checkMesh -writeFields '(nonOrthoAngle skewness)'
+    runParallel checkMesh -writeFields '(nonOrthoAngle skewness cellVolume)' -time '0:'
     
     # Sample the mesh quality fields
-    runParallel postProcess -fields '(nonOrthoAngle skewness)' \
-        -func fieldMinMax -noZero
+    # runParallel postProcess -fields '(nonOrthoAngle skewness cellVolume)' \
+    #     -funcs '(fieldMinMax volFieldValue(volAverage,nonOrthoAngle) volFieldValue(volAverage,skewness) volFieldValue(volAverage,cellVolume))'  -time '0:' #-noZero
+    runParallel postProcess -dict system/postProcessDict -time '0:'
     
     # Generate plots of mesh quality samples 
     python post_process.py

@@ -94,7 +94,7 @@ def main(args):
     )
     training_rs.set_tasks(1)
     training_rs.set_nodes(1)
-    training_rs.set_cpus_per_task(128)
+    training_rs.set_cpus_per_task(8)
 
     ml_model_training = exp.create_model(
         name="ml_model_training",
