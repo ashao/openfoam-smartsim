@@ -30,11 +30,12 @@ echo Create the machine learning mesh motion case
     cd ellipsoid3D_MachineLearningMeshMotion/ellipsoid3D_MachineLearningMeshMotionInput
 
     # Compute the mesh quality fields 
-    runParallel checkMesh -writeFields '(nonOrthoAngle skewness)'
+    runParallel checkMesh -writeFields '(nonOrthoAngle skewness cellVolume)' -time '0:'
     
     # Sample the mesh quality fields
-    runParallel postProcess -fields '(nonOrthoAngle skewness)' \
-        -func fieldMinMax -noZero
+    # runParallel postProcess -fields '(nonOrthoAngle skewness cellVolume)' \
+    #     -funcs '(fieldMinMax volFieldValue(volAverage,nonOrthoAngle) volFieldValue(volAverage,skewness) volFieldValue(volAverage,cellVolume))'  -time '0:' #-noZero
+    runParallel postProcess -dict system/postProcessDict -time '0:'
     
     # Generate plots of mesh quality samples 
     python post_process.py
