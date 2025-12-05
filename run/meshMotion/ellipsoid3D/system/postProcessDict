@@ -1,0 +1,49 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+|=========  postProcessDict: min, max, average for selected fields  =========|
+\*---------------------------------------------------------------------------*/
+
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      postProcessDict;
+}
+
+functions
+{
+    // ---------------------------------------------------------
+    // 1. Field Min & Max
+    // ---------------------------------------------------------
+    readfields1
+    {
+        type    readFields;
+        libs    (fieldFunctionObjects);
+        fields  (nonOrthoAngle skewness cellVolume);
+    }
+    minmax
+    {
+        type        fieldMinMax;
+        libs        (fieldFunctionObjects);
+
+        // List your fields here
+        fields      (nonOrthoAngle skewness cellVolume);
+    };
+
+    // ---------------------------------------------------------
+    // 2. Volume Average for each field
+    // ---------------------------------------------------------
+    average
+    {
+        type        volFieldValue;
+        libs        (fieldFunctionObjects);
+
+
+        // Same field list
+        fields      (nonOrthoAngle skewness cellVolume);
+        operation   volAverage;
+        writeFields false;
+
+    }
+};
+
