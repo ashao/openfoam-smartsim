@@ -12,7 +12,7 @@ from smartsim import Experiment
 from smartsim.status import TERMINAL_STATUSES
 
 
-platform_config = {
+platform_configs = {
     "local": {
         "launcher": "local",
         "interface": "lo",
@@ -32,6 +32,8 @@ platform_config = {
 
 def main(args):
 
+    platform_config = platform_configs[args.platform]
+
     # ----------------------------------------------------------------
     # Create the SmartSim experiment
     # ----------------------------------------------------------------
@@ -42,13 +44,13 @@ def main(args):
     if args.mesh_solver_type == "PINN":
         experiment_name = f"{experiment_name}_{args.pinn_type}"
 
-    exp = Experiment(experiment_name, launcher=platform_config[args.platform]["launcher"])
+    exp = Experiment(experiment_name, launcher=platform_config["launcher"])
 
     # ----------------------------------------------------------------
     # Launch the database
     # ----------------------------------------------------------------
 
-    db = exp.create_database(port=8000, interface=platform_config[args.platform]["interface"])
+    db = exp.create_database(port=8000, interface=platform_config["interface"])
     exp.generate(db, overwrite=True)
 
     # ----------------------------------------------------------------
@@ -72,10 +74,12 @@ def main(args):
     openfoam_rs = exp.create_run_settings(
         exe="moveDynamicMesh",
         exe_args="-parallel",
-        run_command=platform_config[args.platform]["run_command"]
+        run_command=platform_config["run_command"]
     )
     openfoam_rs.set_tasks(num_mpi_ranks)
-    openfoam_rs.set_nodes(1)
+    openfoam_rs.set_cpus_per_task(1)
+    if platform_config["launcher"] == "slurm":
+        openfoam_rs.set("overlap")
 
     # Create the model from the OpenFOAM case argument
     openfoam_model = exp.create_model(
@@ -93,8 +97,9 @@ def main(args):
         exe_args=f"ml_model_training.py {num_mpi_ranks} {args.pinn_type}"
     )
     training_rs.set_tasks(1)
-    training_rs.set_nodes(1)
-    training_rs.set_cpus_per_task(128)
+    training_rs.set_cpus_per_task(32)
+    if platform_config["launcher"] == "slurm":
+        openfoam_rs.set("overlap")
 
     ml_model_training = exp.create_model(
         name="ml_model_training",

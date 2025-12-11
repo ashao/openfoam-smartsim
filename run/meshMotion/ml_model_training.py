@@ -3,8 +3,8 @@ import torch
 import torch.optim as optim
 
 from matplotlib import pyplot as plt
-from scipy.interpolate import griddata
 from smartredis import Client
+from scipy.spatial.transform import Rotation
 
 from MLP import MLP, MLPTrainer
 import PINN
@@ -117,27 +117,24 @@ def retrieve_model(args, dimension):
             input_size=dimension,
             output_size=dimension,
             num_layers=3,
-            layer_width=10,
+            layer_width=20,
             activation_fn=torch.nn.ELU()
         )
     else:
         model = PINN.MLP(
             layer_size=20,
-            nr_layers=2,
+            nr_layers=3,
         )
 
     return model
 
-def retrieve_trainer(args, model, X_boundary, X_bulk, n_bulk_samples, **kwargs):
+def retrieve_trainer(args, model, X_boundary, X_bulk, n_bulk_samples, distances_to_boundary, **kwargs):
     # Initalize the trainer from scratch each time
     try:
         eq = getattr(PINN, args.model_name)()
     except AttributeError:
         raise ValueError(f"Invalid bulk constraint: {args.model_name}")
 
-    trainer = PINN.PINNTrainer(
-        model, X_boundary, X_bulk, eq, n_bulk_samples=n_bulk_samples, **kwargs
-    )
     return trainer
 
 def retrieve_point_fields(client, mpi_ranks, key_constructor):
@@ -173,7 +170,7 @@ def bc_stage(model, trainer, n_epochs):
 
 def bulk_and_bc_stage(model, trainer, n_epochs):
     best_loss = np.inf
-    patience_monitor = MultiCriteriaEarlyStopping(relative_tolerance=0.01)
+    patience_monitor = MultiCriteriaEarlyStopping(relative_tolerance=0.1)
     start = time.perf_counter()
     for epoch in range(n_epochs):
         _, _, validation_losses = trainer.step(epoch)
@@ -218,25 +215,25 @@ def train(args):
     # Retrieve the boundary and bulk points
     points = client.get_tensor("points")
     bulk_points, rank_indices = retrieve_point_fields(client, mpi_ranks, bulk_points_key)
-    distance_to_boundary, _ = retrieve_point_fields(client, mpi_ranks, distances_key)
+    distances_to_boundary, _ = retrieve_point_fields(client, mpi_ranks, distances_key)
 
     print(f"Solution dimension = {dimension} Number of Points={len(points)}", flush=True)
 
-    # Scale all the inputs (if needed)
-    boundary_points_scaled = points
-    bulk_points_scaled = bulk_points
+    # Scale and transform inputs (if needed)
+    # Apply a rotation just in case any of the displacement vectors have zero components
+    rotation = Rotation.random()
+    rotation_inv = rotation.inv()
+    rotation_inv_torch= torch.from_numpy(rotation_inv.as_matrix().astype("float32")).to(args.device)
+    boundary_points_scaled = rotation.apply(points)
+    bulk_points_scaled = rotation.apply(bulk_points)
 
     # Convert all the interior points to a tensor for final inference
     bulk_points_for_inference = torch.from_numpy(bulk_points_scaled).float().to(args.device)
 
     model = retrieve_model(args, dimension)
-    trainer = retrieve_trainer(
-        args,
-        model,
-        boundary_points_scaled,
-        bulk_points_scaled,
-        n_bulk_samples=2000,
-        loss_stop=1e-2,
+    eq = getattr(PINN, args.model_name)()
+    trainer = PINN.PINNTrainer(
+        model, boundary_points_scaled, bulk_points_scaled, eq, distances_to_boundary, n_bulk_samples=10000
     )
 
     timestep = 1
@@ -252,10 +249,8 @@ def train(args):
         displacements = client.get_tensor("displacements")
         client.delete_tensor("data_ready")
 
-        trainer.set_boundary_displacements(displacements)
-        mag = np.sum(displacements**2, axis=1)
-        mag_avg = np.mean(mag[mag>0])
-        print(f"Average magnitude of displacements: {mag_avg}")
+        displacements_scaled = rotation.apply(displacements)
+        trainer.set_boundary_displacements(displacements_scaled)
 
         # Begin curriculum training
         # Stage: Boundary conditions only
@@ -271,13 +266,11 @@ def train(args):
         # Put the model in evaluation mode and perform the inference for bulk points
         model.eval()
         model.load_state_dict(best_state)
-        bulk_displacements = (
-            model._impl.forward(bulk_points_for_inference)
-            .detach()
-            .to("cpu")
-            .numpy()
-            .astype(np.float64)
-        )
+        bulk_inference = model._impl.forward(bulk_points_for_inference)
+        # Rotate back to the cartesian grid
+        bulk_inference = (rotation_inv_torch @ bulk_inference.T).T
+        bulk_displacements = bulk_inference.detach().to("cpu").numpy().astype(np.float64)
+
         model.train()
 
         # Put all the displacements back into the database by rank

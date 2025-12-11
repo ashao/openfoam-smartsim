@@ -161,6 +161,7 @@ class PINNTrainer(ABC):
         boundary_points,
         bulk_points,
         bulk_equations,
+        distances_to_boundary,
         n_bulk_samples=500,
         lr=1e-2,
         loss_stop=0.5,
@@ -182,7 +183,7 @@ class PINNTrainer(ABC):
 
         # Randomly sample bulk
         self.n_bulk_samples = n_bulk_samples
-        self._sample_bulk(n_bulk_samples, bulk_points)
+        self._sample_bulk(n_bulk_samples, bulk_points, distances_to_boundary)
 
         # Batch the boundary and bulk points together
         self._batch_boundary_and_interior()
@@ -196,10 +197,17 @@ class PINNTrainer(ABC):
             torch.from_numpy(displacements).float().to(self.device)
         )
 
-    def _sample_bulk(self, n_bulk_samples, bulk_points):
-        indices = list(range(len(bulk_points)))
-        shuffle(indices)
-        train_indices = indices[:n_bulk_samples]
+    def _sample_bulk(self, n_bulk_samples, bulk_points, distances_to_boundary):
+        indices = np.array(range(len(bulk_points)))
+        print(distances_to_boundary.shape, len(bulk_points))
+        on_boundary = ~np.isclose(distances_to_boundary, 0., atol=1.e-3)
+        indices = indices[on_boundary.flatten()]
+        inverse_distance = 1./distances_to_boundary[indices]
+        wts = inverse_distance**2
+        wts = inverse_distance
+        wts = wts/np.sum(wts)
+        train_indices = np.random.choice(indices, n_bulk_samples, replace=False, p=wts.flatten())
+
         self.bulk_points = (
             torch.from_numpy(bulk_points[train_indices]).float().to(self.device)
         )
